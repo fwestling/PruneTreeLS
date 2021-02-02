@@ -1,0 +1,22 @@
+#!/bin/bash
+
+#Take in point cloud as argument 1 (binary=3d, fields=x,y,z)
+# Take in a single point as an argument, as well as a radius
+# return all points within the given radius
+
+if [ $# -lt 3 ] 
+then
+	echo "Usage: $0 point-cloud.bin point radius"
+	exit
+fi
+
+
+read_file=$1
+point=$2
+radius=$3
+
+cat $read_file | 
+	csv-paste "-;binary=3d" "value=$point;binary=3d" | 
+	points-calc distance --binary=6d --fields=first,second |
+	csv-select --binary=7d --fields=,,,,,,d --less=$radius |
+	csv-shuffle --binary=7d --fields=x,y,z --output-fields=x,y,z

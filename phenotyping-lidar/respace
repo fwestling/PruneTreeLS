@@ -1,0 +1,65 @@
+#!/bin/bash
+
+# Utility to artificially adjust the spacing of trees
+
+export readonly name=$( basename $0 )
+
+source $( type -p comma-application-util ) || (error "comma not installed")
+function errcho { (>&2 echo "$name: $1") }
+function error
+{
+    errcho "error: $1"
+    exit 1
+}
+
+function go() {
+  # Input: a point cloud of the (segmented) density block I want to move
+  # Input: Amount to change spacing by (in metres)
+  bin=$1			# binary file format
+  fields=$2	# file fields
+  spacing=$3
+
+  REF_ID="/home/fwes7558/src/tree-crops/phenotyping-lidar/translations.bin"
+  ref_bin=ui,d
+  ref_fields=id,shift
+
+  xf=$(echo $fields | csv-fields clear --except=x,y,z)
+
+  cat | csv-join --binary=$bin --fields=$fields "$REF_ID;binary=$ref_bin;fields=$ref_fields" |
+  	csv-eval --binary=$bin,$ref_bin --fields=$xf,,shift "x= x + shift*$spacing" |
+  	csv-shuffle --binary=$bin,$ref_bin --fields=$fields -o=$fields
+
+}
+
+function option-description
+{
+    cat <<eof
+--binary=[<format>]; default="t,3d,ui"; Binary format used in point clouds
+--fields=[<fields>]; default="t,x,y,z,id"; Point cloud fields, must include "x,y,z,id".  "id" is the trunk id
+--shift=[<shift>]; default=1; How many metres to adjust the tree spacing
+eof
+}
+
+function usage
+{
+    cat <<eof
+
+$name artificially re-spaces the trees in the given point cloud
+
+usage: cat pointcloud | $name <operation> [options]
+
+options:
+$( option-description  | sed 's/^/    /g' )
+
+eof
+    exit 1
+}
+
+if (( $( comma_options_has --help $@ ) || $( comma_options_has -h $@ ) )) ; then usage ; fi
+options=$( option-description | comma-options-to-name-value "$@" ) || error "invalid command line options"
+comma_path_value_to_var --prefix="options" <<< "$options"
+eval "$( option-description | comma-options-to-name-value "$@" | comma_path_value_mangle )"
+
+set -e # Kill if anything errors out; we don't want it to run everything on bad datasets
+
+cat | go $options_binary $options_fields $options_shift

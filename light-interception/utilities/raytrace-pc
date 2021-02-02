@@ -1,0 +1,173 @@
+#!/bin/bash
+
+### TODO: Convert to standard filter behaviour for point cloud? (read from file if given, else STDIN)
+
+export readonly name=$( basename $0 )
+
+source $( type -p comma-application-util ) || (error "comma not installed")
+function errcho { (>&2 echo "$name: $1") }
+function error
+{
+    errcho "error: $1"
+    exit 1
+}
+function go () {
+	pc=$1 # Point cloud to raytrace
+	sky=$2 # Sky model
+	bin=$3 # Binary format of point cloud
+	fields=$(echo $4 | csv-fields rename --fields=trunk,ac,tc --to=input_trunk,input_ac,input_tc) # Fields of point cloud
+	tc=$5 # Base transmission coefficient
+	raytrace_size=$6 # Voxel size to use for raytracing
+	trunk_tc=$7
+	trunk_ac=$8
+	cores=$9
+
+	# echo "PC: $pc" >&2
+	# echo "Sky: $sky" >&2
+	# echo "Bin: $bin" >&2
+	# echo "Fields: $fields" >&2
+	# echo "Cores: $cores" >&2
+
+
+	ac=$(echo "1 - $tc" | bc) # Base absorption coefficient
+
+	idFields=$(echo $fields | csv-fields rename --fields=x,y,z --to=id,id,id)
+
+	## Would be great to ditch this temp file, but it's non-trivial
+	temp_ui=$(mktemp) ## This allows multiple processes to run at once
+		## However, if this function doesn't finish, then /tmp will get cluttered with big files.
+		## /tmp empties on reboot.
+
+	## Pre-processing:
+	### Input: Point cloud with $fields.  $fields must include x,y,z, may include trunk,ac,tc
+	### Output: Point cloud with $out_fields.  $out_fields must include x,y,z,ac,tc,uid
+
+	## Add a tc and ac field since it's required for next steps; use default values if actual values not provided.
+	cat $pc |
+		if echo "$fields" | csv-fields has --fields=input_trunk,input_tc,input_ac
+		then
+			csv-eval -b $bin -f $fields "tc=input_tc;ac=input_ac"
+		else
+			csv-eval -b $bin -f $fields "tc=where(input_trunk==1,$trunk_tc,1-input_ac);ac=where(input_trunk==1,$trunk_ac,1-input_tc)" \
+			  --default "input_trunk=0;input_tc=$tc;input_ac=$ac"
+		fi | csv-blocks group --binary=$bin,2d --fields=$idFields > $temp_ui
+	newBin="$bin,2d,ui"
+	newFields="$fields,tc,ac,id"
+
+	[[ $verbose ]] && echo "Ray tracing from" $(wc -l $sky | cut -f1 -d' ') "sky segments" >&2
+	[[ $verbose ]] && echo -n "Calculating... have finished: " >&2
+
+	export -f rayTrace
+
+	# Trace from each sky node
+	cat $sky |
+	 parallel -n 1 -j ${cores} rayTrace $temp_ui {} $raytrace_size $newBin $newFields {#} |
+	 csv-calc sum --binary=2d,ui --fields=nrg,dns,id |
+	# Rejoin energies to original points
+	 csv-join --binary=2d,ui --fields=nrg,dns,id "$temp_ui;fields=$newFields;binary=$newBin" |
+	# Output should have the format $fields,nrg,dns
+	 csv-shuffle --binary=2d,ui,$newBin --fields=nrg,dns,uid,$newFields --output-fields=$fields,nrg,dns
+  [[ $quiet ]] || echo "" >&2
+
+  [[ $quiet ]] || [[ $verbose ]] && echo -e "\nTo visualise:" >&2
+	[[ $quiet ]] || [[ $verbose ]] && echo "| view-points \"--binary=$newBin,2d\" \"--fields=$fields,,scalar\"" >&2
+
+	rm $temp_ui
+}
+
+## Raytraces from a given sky node through a given point cloud
+## The function takes in bin and fields (must contain x,y,z), and outputs "nrg,uid" in "d,ui" format
+function rayTrace()
+{
+	local pc=$1
+	local sky_node=$2
+	local voxel_size=$3
+	local bin=$4
+	local fields=$5
+	local iteration=$6
+	
+	local fields_uid=`echo $fields | csv-fields rename --fields=id --to=uniqueID`
+
+	local incident_intensity=$(echo $sky_node | csv-shuffle --fields=elev,azi,irr --output-fields=irr)
+	local node_elevation=$(echo $sky_node | csv-shuffle --fields=elev,azi,irr --output-fields=elev)
+	local node_azimuth=$(echo $sky_node | csv-shuffle --fields=elev,azi,irr --output-fields=azi)
+
+	[[ $quiet ]] || echo -n "$iteration, " >&2
+
+	# Speed up later csv_eval by precomputing calculations which have the same value for every point.
+	local precalc=$(echo "$incident_intensity,$voxel_size" | csv-eval --format=d,d --fields=i,s "x=i*(s**2)" | cut -d, -f3)
+
+	local only_coord_fields=$(echo $fields | csv-fields clear --except=x,y,z)
+
+	# Rotate z towards sun, voxelise, assign ID to z-columns, assign ID to voxels in ascending order in each voxel (NOTE: erases all but one point in each voxel)
+	## This whole part is arcane, but it works...I wouldn't suggest changing anything
+	cat $pc | points-frame --binary=$bin --fields=$only_coord_fields --from "0,0,0,0,0,$(math-deg2rad -$node_azimuth)" |
+		points-frame --binary=$bin --fields=$only_coord_fields --from "0,0,0,0,$(math-deg2rad $(echo "-90 - $node_elevation" | bc)),0" |
+		points-to-voxel-indices --binary=$bin --fields=$fields --resolution=$voxel_size |
+		csv-shuffle --binary=$bin,3ui --fields=$fields,vx2,vy2,vz2 --output-fields=vx2,vy2,vz2,tc,ac |
+		csv-sort --binary=3ui,2d --fields=a,b,vz,tc,ac --order=b,a,vz --reverse |
+		csv-blocks group --binary=3ui,2d --fields=id,id,id |
+		csv-calc --binary=3ui,2d,ui mean,size --fields=x,y,z,tc,ac,block |
+		csv-shuffle --binary=3ui,2d,6ui --fields=x,y,z,meanTC,meanAC,w --output-fields=x,y,z,meanTC,meanAC,w  | # effectively gets you "points-to-voxels"
+		csv-blocks group --binary=3ui,2d,ui --fields=id,id,vz |
+		csv-blocks index --binary=3ui,2d,2ui --fields=vx,vy,vz,mtc,mac,weight,block |  # vx,vy,vz,tc,weight,column,ray
+		accumulate.py --binary=3ui,2d,3ui --fields=vx,vy,vz,tc,ac,weight,block,ray |
+		csv-eval --binary=3ui,2d,3ui,d --fields=vx,vy,vz,meanTC,ac,weight,column,ray,acc_tc "nrg=$precalc/weight*ac*acc_tc;dns=$incident_intensity*ac*acc_tc" |
+		# This next step involves some gross replication, but it's significantly faster than using base64 to store in a variable
+		csv-join --binary=3ui,2d,3ui,3d --fields=id,id,id \
+		<(cat $pc | points-frame --binary=$bin --fields=$only_coord_fields --from "0,0,0,0,0,$(math-deg2rad -$node_azimuth)" |
+			points-frame --binary=$bin --fields=$only_coord_fields --from "0,0,0,0,$(math-deg2rad $(echo "-90 - $node_elevation" | bc)),0" |
+			points-to-voxel-indices --binary=$bin --fields=$fields --resolution=$voxel_size |
+			csv-shuffle --binary=$bin,3ui --fields=$fields_uid,vx2,vy2,vz2 --output-fields=uniqueID,vx2,vy2,vz2,tc,ac)";fields=uniqueID,id,id,id,tc,ac;binary=ui,3ui,2d" |
+		csv-shuffle --binary=3ui,2d,3ui,3d,ui,3ui,2d \
+		--fields=vx2,vy2,vz2,m_tc,m_ac,weight,column,ray,acc_tc,nrg,dns,uniqueID,vx1,vy1,vz1,tc,ac \
+		--output-fields=nrg,dns,uniqueID
+}
+
+function option-description
+{
+    cat <<eof
+--sky=[<sky>]; sky from which to raytrace.  Expected format: ASCII (elevation[degrees], azimuth[degrees], irradiance[W/m^2])
+--binary=[<binary>]; default=3d,ui; binary format of input point cloud
+--fields=[<fields>]; default=x,y,z,trunk; fields of input point cloud.  x,y,z required. trunk,ac,tc optional.
+--beta=[<coefficient>]; default=0.65; transmission coefficient to use for foliage/unlabelled points
+--raytrace-size=[<size>]; default=0.10; Size of voxels to raytrace through
+--beta-trunk=[<coefficient>]; default=0.0; Transmission coefficient of trunk matter
+--alpha-trunk=[<coefficient>]; default=0.0; Absorption coefficient of trunk matter
+--cores=[<cores>]; default=0; Number of cores to use in processing
+--verbose; Output extra progress informaiton to stderr
+--quiet; Do not output progress to stderr
+eof
+}
+
+function usage
+{
+    cat <<eof
+
+$name runs a raytrace on the given point cloud and processes the output into a standard form.
+
+usage: $name <pc> [options]
+
+positional argument:
+point_cloud=<file>; binary point cloud containing visible ceptometer stakes to which the grid should be aligned.  PC should consist of georeferenced XYZ points only
+
+options:
+$( option-description  | sed 's/^/    /g' )
+
+eof
+    exit 1
+}
+
+if (( $( comma_options_has --help $@ ) || $( comma_options_has -h $@ ) )) ; then usage ; fi
+options=$( option-description | comma-options-to-name-value "$@" ) || error "invalid command line options"
+comma_path_value_to_var --prefix="options" <<< "$options"
+eval "$( option-description | comma-options-to-name-value "$@" | comma_path_value_mangle )"
+
+(( $( comma_options_has --verbose "$@" ) )) && export readonly verbose=true
+(( $( comma_options_has --quiet "$@" ) )) && export readonly quiet=true
+
+set -e # Kill if anything errors out; we don't want it to run everything on bad datasets
+
+echo $options_fields | csv-fields has --fields x,y,z || error "Missing fields x,y,z"
+
+go $1 $options_sky $options_binary $options_fields $options_beta $options_raytrace_size $options_beta_trunk $options_alpha_trunk $options_cores

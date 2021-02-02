@@ -1,0 +1,149 @@
+#!/bin/bash
+
+## georeference
+## Given two point clouds, align them based on manual input.
+
+export readonly name=$( basename $0 )
+
+source $( type -p comma-application-util ) || (error "comma not installed")
+function errcho { (>&2 echo "$name: $1") }
+function error
+{
+    errcho "error: $1"
+    exit 1
+}
+
+function getPoints_origin () {
+  local f=$1
+  local bin=$2
+  local fields=$3
+  max=$(cat $f | csv-shuffle --binary=$bin --fields=$fields -o=x,y,z |
+    csv-paste "-;binary=3d" value="0,0,0;binary=3d" |
+    points-calc distance --binary=6d --fields=first,second |
+    csv-eval --binary=7d --fields=,,z,,,,d "d=d/10.0 + z" |
+    csv-calc max --binary=7d --fields=,,,,,,d | csv-from-bin d)
+  min=$(cat $f | csv-shuffle --binary=$bin --fields=$fields -o=x,y,z |
+    csv-paste "-;binary=3d" value="0,0,0;binary=3d" |
+    points-calc distance --binary=6d --fields=first,second |
+    csv-eval --binary=7d --fields=,,z,,,,d "d=d/10.0 + z" |
+    csv-calc min --binary=7d --fields=,,,,,,d | csv-from-bin d)
+  points=$(cat $f | csv-shuffle --binary=$bin --fields=$fields -o=x,y,z |
+      csv-paste "-;binary=3d" value="0,0,0;binary=3d" |
+      points-calc distance --binary=6d --fields=first,second |
+      csv-eval --binary=7d --fields=,,z,,,,d "d=d/10.0 + z" |
+      view-points --binary=7d --fields=x,y,z,,,,scalar --colour=$min:$max,jet --size=20000000)
+  echo "$points"
+  echo "" >&2
+  echo "$points" >&2
+  echo "" >&2
+}
+function getPoints_height () {
+  local f=$1
+  local bin=$2
+  local fields=$3
+  max=$(cat $f | csv-shuffle --binary=$bin --fields=$fields -o=x,y,z |
+    csv-calc max --binary=3d --fields=,,z | csv-from-bin d)
+  min=$(cat $f | csv-shuffle --binary=$bin --fields=$fields -o=x,y,z |
+    csv-calc min --binary=3d --fields=,,z | csv-from-bin d)
+  points=$(cat $f | csv-shuffle --binary=$bin --fields=$fields -o=x,y,z |
+      csv-eval --binary=3d --fields=x,y,z "c=z" --output-format=d |
+      view-points --binary=4d --fields=x,y,z,scalar --colour=$min:$max,jet --size=20000000)
+  echo "$points"
+  echo "" >&2
+  echo "$points" >&2
+  echo "" >&2
+}
+
+function getPoints () {
+  local f=$1
+  local bin=$2
+  local fields=$3
+  center=$(cat $f | csv-calc mean --binary=$bin --fields=$fields |
+    csv-shuffle --binary=$bin --fields=$fields -o=x,y,z | csv-from-bin 3d)
+  echo "Center: $center" >&2
+  points=$(cat $f | csv-shuffle --binary=$bin --fields=$fields -o=x,y,z |
+      csv-paste "-;binary=3d" value="$center;binary=3d" |
+      points-calc distance --binary=6d --fields=first,second |
+      view-points --binary=7d --fields=x,y,z,,,,scalar --colour=0:20,jet --size=10000000)
+  echo "$points"
+  echo "" >&2
+  echo "$points" >&2
+  echo "" >&2
+}
+
+# View stdin and one arg with good colouring
+function view-nice() {
+  pc=$1
+  bin=$2
+  fields=$3
+  center=$(cat $pc | csv-calc mean --binary=$bin --fields=$fields |
+    csv-shuffle --binary=$bin --fields=$fields -o=x,y,z | csv-from-bin 3d)
+
+  cat | csv-shuffle --binary=$bin --fields=$fields -o=x,y,z |
+    csv-paste "-;binary=3d" value="$center;binary=3d" |
+    points-calc distance --binary=6d --fields=first,second
+    view-points "-" --binary=7d --fields=x,y,z,,,,scalar --colour=0:20,jet --size=10000000 \
+      <(cat $pc | csv-shuffle --binary=$bin --fields=$fields -o=x,y,z |
+        csv-paste "-;binary=3d" value="$center;binary=3d" |
+        points-calc distance --binary=6d --fields=first,second)
+}
+
+function go () {
+	local ref=$1
+	local scan=$2
+	local binary=$3
+	local fields=$4
+
+  echo "REF: Select a number of recognisable points (e.g. trunk bases) in a memorable order" >&2
+  points_ref=$(getPoints_height $ref $binary $fields)
+
+  echo "SCAN: Select the same points in this point cloud." >&2
+  points_scan=$(getPoints_origin $scan $binary $fields)
+
+  transl=$(echo $points_ref | csv-paste <(echo "$points_ref") <(echo "$points_scan") | points-align| cut -d, -f1-6)
+  echo "" >&2
+  echo "$transl" >&2
+  echo "" >&2
+  cat $scan | points-frame --binary=$binary --fields=$fields --from $transl |
+  tee >(view-points --binary=$binary --fields=$fields --colour=blue "$ref;colour=red" --size=20000000) | cat
+  # tee >(view-nice $ref $binary $fields) | cat
+}
+
+
+function option-description
+{
+    cat <<eof
+--binary=[<binary>]; default=3d; Binary format of input files
+--fields=[<fields>]; default=x,y,z; Fields of input files. Must include x,y,z
+eof
+}
+
+function usage
+{
+    cat <<eof
+
+$name Uses manual labelling to align two point clouds.  Once <scan> is aligned
+to <ref>, it is output to STDOUT.
+
+usage: $name <ref> <scan> [options]
+
+ref=[<pointcloud>]; Point cloud to align to
+scan=[<pointcloud>]; Point cloud to align
+
+options:
+$( option-description  | sed 's/^/    /g' )
+
+eof
+    exit 1
+}
+
+if (( $( comma_options_has --help $@ ) || $( comma_options_has -h $@ ) )) ; then usage ; fi
+options=$( option-description | comma-options-to-name-value "$@" ) || error "invalid command line options"
+comma_path_value_to_var --prefix="options" <<< "$options"
+eval "$( option-description | comma-options-to-name-value "$@" | comma_path_value_mangle )"
+
+set -e # Kill if anything errors out; we don't want it to run everything on bad datasets
+
+echo $options_fields | csv-fields has --fields x,y,z || error "Missing fields x,y,z"
+
+go $1 $2 $options_binary $options_fields

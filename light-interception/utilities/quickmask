@@ -1,0 +1,127 @@
+#!/bin/bash
+
+## Quick masking utility
+### Uses manual labelling to pull out an area defined by an irregular rectangular prism
+
+## TODO: Remove need to be axis-aligned?
+
+export readonly name=$( basename $0 )
+
+source $( type -p comma-application-util ) || (error "comma not installed")
+function errcho { (>&2 echo "$name: $1") }
+function error
+{
+    errcho "error: $1"
+    exit 1
+}
+
+function getPoints () {
+  local f=$1
+  local bin=$2
+  local fields=$3
+  echo "Select 4 points on the cloud" >&2
+  echo "Select the extents along the x axis" >&2
+  echo "Finally select the extents along the y axis" >&2
+
+  center=$(cat $f | csv-calc mean --binary=$bin --fields=$fields |
+    csv-shuffle --binary=$bin --fields=$fields -o=x,y,z | csv-from-bin 3d)
+  points=$(cat $f | csv-shuffle --binary=$bin --fields=$fields -o=x,y,z |
+      csv-paste "-;binary=3d" value="$center;binary=3d" |
+      points-calc distance --binary=6d --fields=first,second |
+      view-points --binary=7d --fields=x,y,z,,,,scalar --colour=0:20,jet --size=10000000)
+  echo "$points"
+  echo "" >&2
+  echo "$points" >&2
+  echo "" >&2
+}
+
+function go () {
+  pc=$1
+  bin=$2
+  fields=$3
+
+  xyBounds=$(getPoints $1 $bin $fields)
+  xMin=$(echo "$xyBounds" | csv-shuffle --fields=x,y,z -o=x | csv-sort --fields=a | head -1)
+	xMax=$(echo "$xyBounds" | csv-shuffle --fields=x,y,z -o=x | csv-sort --fields=a | tail -1)
+	yMin=$(echo "$xyBounds" | csv-shuffle --fields=x,y,z -o=y | csv-sort --fields=a | head -1)
+	yMax=$(echo "$xyBounds" | csv-shuffle --fields=x,y,z -o=y | csv-sort --fields=a | tail -1)
+
+  echo "xmin: $xMin" >&2
+	echo "xmax: $xMax" >&2
+	echo "ymin: $yMin" >&2
+	echo "ymax: $yMax" >&2
+
+
+  cat $1 |
+    csv-select --binary=$bin --fields=$fields "x;less=$xMax;greater=$xMin" "y;less=$yMax;greater=$yMin" |
+    points-to-voxels --binary=$bin --fields=$fields --resolution=0.05 |
+    csv-shuffle --binary=3ui,3d,ui --fields=,,,x,y,z -o=x,y,z |
+    points-ground height --binary=3d --fields=x,y,z --up=-z --radius=0.25 |
+    csv-select --binary=4d --fields=,,,h "h;greater=0.3" |
+    csv-shuffle --binary=4d --fields=x,y,z -o=x,y,z |
+    tee >(view-points "-;binary=3d;weight=4;colour=red" "$pc;binary=$bin;fields=$fields" --size=10000000) | cat
+
+  # echo "$center,$px" | points-calc distance --fields="first,second" >&2
+  # rad_x=$(echo "$center,$px" | points-calc distance --fields="first,second" |
+  #   csv-shuffle --fields=x,y,z,x,y,z,d -o=d)
+  # rad_y=$(echo "$center,$py" | points-calc distance --fields="first,second" |
+  #   csv-shuffle --fields=x,y,z,x,y,z,d -o=d)
+  #
+  # fields_x=$(echo $fields | csv-fields clear --except x |
+  #   csv-fields prefix --path "first")
+  # fields_y=$(echo $fields | csv-fields clear --except y |
+  #   csv-fields prefix --path "first")
+  # cat $1 | csv-paste "-;binary=$bin" "value=$center;binary=3d" |
+  #   points-calc distance --binary=$bin,3d --fields=$fields_x,second/x |
+  #   points-calc distance --binary=$bin,4d --fields=$fields_y,,second/y |
+  #   csv-select --binary=$bin,5d --fields=`echo "$fields" | csv-fields clear`,,,,xD,yD "xD;less=$rad_x" "yD;less=$rad_y" |
+  #   csv-shuffle --binary=$bin,5d --fields=$fields -o=$fields |
+
+
+    # points-to-voxels --binary=$bin --fields=$fields --resolution=0.05 |
+    # csv-shuffle --binary=3ui,3d,ui --fields=,,,x,y,z -o=x,y,z |
+    # points-ground height --binary=3d --fields=x,y,z --up=-z --radius=0.25 |
+    # csv-select --binary=4d --fields=,,,h "h;greater=0.2" |
+    # csv-shuffle --binary=4d --fields=x,y,z -o=x,y,z |
+    # tee >(view-points "-;binary=3d;weight=4;colour=red" "$pc;binary=$bin;fields=$fields" --size=10000000) | cat
+}
+
+function option-description
+{
+    cat <<eof
+--binary=[<format>]; default=3d; Binary format of input point cloud
+--fields=[<fields>]; default=x,y,z; Fields of input point cloud; must include at least x,y,z
+eof
+}
+
+function usage
+{
+    cat <<eof
+
+    $name assists with extracting a mask for a particular tree/pointcloud.
+    3 points are selected manually, then a rectangular prism is calculated which extracts
+    just the area of interest in 3d format, voxelised at a resolution of 0.5
+
+usage: $name <pc> [options]
+
+positional argument:
+pc=<file>; Point cloud
+
+options:
+$( option-description  | sed 's/^/    /g' )
+
+eof
+    exit 1
+}
+
+if (( $( comma_options_has --help $@ ) || $( comma_options_has -h $@ ) )) ; then usage ; fi
+options=$( option-description | comma-options-to-name-value "$@" ) || error "invalid command line options"
+comma_path_value_to_var --prefix="options" <<< "$options"
+eval "$( option-description | comma-options-to-name-value "$@" | comma_path_value_mangle )"
+
+(( $( comma_options_has --extract "$@" ) )) && export readonly extract=true
+(( $( comma_options_has --invert "$@" ) )) && export readonly invert=true
+
+zDiff=0 # zDiff is used to compensate when a point cloud is close to 0 so IDs won't work
+
+go $1 $options_binary $options_fields

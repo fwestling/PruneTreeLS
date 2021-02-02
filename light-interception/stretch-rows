@@ -1,0 +1,59 @@
+#!/bin/bash
+
+# Takes in a point cloud, approximates having longer rows available in the data
+# Binary point cloud on stdin, arguments:
+# 	bin, fields, ntimes
+
+
+bin=$1
+fields=$2
+ntimes=$3
+
+[[ $ntimes == 0 ]] && cat && exit
+
+zFields=`echo "$fields" | csv-fields clear --except=z`
+xyzFields=`echo "$fields" | csv-fields clear --except=x,y,z`
+xcompFields=`echo "$xyzFields" | csv-fields rename --fields=x,y,z --to=first/x,,`
+ycompFields=`echo "$xyzFields" | csv-fields rename --fields=x,y,z --to=,first/y,`
+
+pc=`cat | base64`
+minmax=`echo -n "$pc" | base64 -d | csv-calc min,max --binary=$bin --fields=$zFields | csv-from-bin 2d`
+min=`echo "$minmax" | cut -d, -f1`
+max=`echo "$minmax" | cut -d, -f2`
+
+### This code isolates the ends of the pc (in a very basic way) for copying
+mean=`echo -n "$pc" | base64 -d | csv-calc mean --binary=$bin --fields=$xyzFields | csv-from-bin 3d`
+meanX=`echo "$mean" | csv-shuffle --fields=x,y,z --output-fields=x`
+meanY=`echo "$mean" | csv-shuffle --fields=x,y,z --output-fields=y`
+
+echo -n "$pc" | base64 -d | csv-paste "-;binary=$bin" "value=$mean;binary=3d" |
+ points-calc distance --binary=$bin,3d --fields=$ycompFields,,second/y | 
+ csv-select --binary=$bin,3d,d --fields=$fields,xx,yy,zz,dist "dist;greater=5;less=15" | 
+ csv-shuffle --binary=$bin,3d,d --fields=$fields --output-fields=$fields > EW-ends.tmp
+
+echo -n "$pc" | base64 -d | csv-paste "-;binary=$bin" "value=$mean;binary=3d" |
+ points-calc distance --binary=$bin,3d --fields=$xcompFields,second/x | 
+ csv-select --binary=$bin,3d,d --fields=$fields,xx,yy,zz,dist "dist;greater=5;less=15" | 
+ csv-shuffle --binary=$bin,3d,d --fields=$fields --output-fields=$fields > NS-ends.tmp
+
+cat EW-ends.tmp | csv-select --binary=$bin --fields=$fields "y;greater=$meanY" > E-ends.tmp
+cat EW-ends.tmp | csv-select --binary=$bin --fields=$fields "y;less=$meanY" > W-ends.tmp
+cat NS-ends.tmp | csv-select --binary=$bin --fields=$fields "x;greater=$meanX" > N-ends.tmp
+cat NS-ends.tmp | csv-select --binary=$bin --fields=$fields "x;less=$meanX" > S-ends.tmp
+
+## View (for debugging purposes)
+
+# echo -n "$pc" | base64 -d | view-points --binary=$bin --fields=$fields --colour=$min:$max "E-ends.tmp" "W-ends.tmp" "N-ends.tmp" "S-ends.tmp"
+
+## Output all
+
+echo -n "$pc" | base64 -d
+for n in `seq 0 $ntimes`
+do
+	cat E-ends.tmp | csv-eval --fields=$fields --binary=$bin "y=y+10*$n"
+	cat W-ends.tmp | csv-eval --fields=$fields --binary=$bin "y=y-10*$n" 
+	cat N-ends.tmp | csv-eval --fields=$fields --binary=$bin "x=x+10*$n" 
+	cat S-ends.tmp | csv-eval --fields=$fields --binary=$bin "x=x-10*$n" 
+done
+
+rm *ends.tmp

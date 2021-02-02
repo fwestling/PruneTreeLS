@@ -1,0 +1,294 @@
+#!/bin/bash
+
+# Performs an operation to a point cloud using graph search methods
+
+export readonly name=$(basename $0)
+
+# COST FUNCTIONS FOR EDGE COMPUTATION
+# Euclidian distance squared (really punish big jumps)
+export readonly NORMSQ="d=((xA-xB)**2 + (yA-yB)**2 + (zA-zB)**2)"
+# Euclidian distance (punish big jumps)
+export readonly NORM="d=sqrt((xA-xB)**2 + (yA-yB)**2 + (zA-zB)**2)"
+# Inverse distance (punish small jumps)
+export readonly INVNORM="d=1/sqrt((xA-xB)**2 + (yA-yB)**2 + (zA-zB)**2)"
+# Height difference (favour dropping quickly downwards)
+export readonly HEIGHTDIFF="d=abs(zB-zA)"
+# Weight difference (favour staying in similar density areas)
+# export readonly WEIGHTDIFF="d=abs(wB-wA)"
+# Absolute weight (favour lower-density voxels)
+# export readonly WEIGHT="d=wA"
+# Inverse weight (favour higher-density voxels)
+# export readonly WEIGHTINV="d=1/wA"
+
+source $(type -p comma-application-util) || (error "comma not installed")
+function errcho() { (echo >&2 "$name: $1"); }
+function error() {
+  errcho "error: $1"
+  exit 1
+}
+
+function get_trunk_points() {
+  PC=$1
+  bin=$2
+  fields=$3
+
+  if [[ ! -s $TRUNKS ]]; then
+    echo "No trunk points provided; please click all trunks in point cloud" >&2
+    min=$(cat $PC | csv-calc min --binary=$bin --fields=$(echo $fields | csv-fields clear --except=z) | csv-from-bin d)
+    max=$(cat $PC | csv-calc max --binary=$bin --fields=$(echo $fields | csv-fields clear --except=z) | csv-from-bin d)
+    rm -rf pipe && mkfifo pipe && cat pipe |
+      view-points <(cat $PC | csv-eval --binary=$bin --fields=$fields "added_height=z" --output-format=d)";binary=$bin,d;fields=$(echo $fields | csv-fields clear --except=x,y,z),scalar;colour=$min:$max,jet" \
+    "-;colour=sky;weight=25" --size=10000000 | tee pipe >$TRUNKS
+    rm -rf pipe
+  fi
+
+  fields=$(head -1 $TRUNKS | csv-fields numbers | csv-fields rename --fields=1,2,3,4 --to=x,y,z,id)
+  if ! echo $fields | csv-fields has --fields=id; then
+    [[ $verbose ]] && echo "Appending IDs" >&2
+    T=$(cat $TRUNKS)
+    [[ $verbose ]] && echo "$T" >&2
+    echo "$T" | csv-paste "-" "line-number" |
+      csv-eval --format=3d,ui --fields=x,y,z,i "i=i+1" >$TRUNKS
+  fi
+
+  # [[ $verbose ]] && echo "== Trunk points: ==" >&2
+  # [[ $verbose ]] && cat $TRUNKS >&2
+  # [[ $verbose ]] && echo "===================" >&2
+}
+
+function process_ground() {
+  local pc=$1
+  local bin=$2
+  local fields=$3
+  local vs=$4
+
+  cat $pc | csv-paste "-;binary=$bin" line-number >$NO_GND
+}
+
+function gen_graph() {
+  local bin=$1
+  local fields=$2
+  local vs=$3
+  local radius=$4
+
+  calcFields="voxConn,voxConnV,voxConnH,eigen/la,eigen/ll,eigen/lp,eigen/lv,areaV,areaZ,volume,densA,densB"
+  if echo $fields | csv-fields has --fields=$calcFields,vox_id --any; then
+    echo "Cosine" >&2
+    cat | graph-edge cosine --binary=$bin --fields=$(echo $fields | csv-fields rename --fields=vox_id --to=id) --calc-fields=$calcFields --invert --output-nodes=$NODES >$EDGES
+  else
+    # Generate nodes using voxelised point cloud as a "filter"
+    cat | points-to-voxels --binary=$bin --fields=$fields --resolution=$vs |
+      csv-select --binary=3ui,3d,ui --fields=,,,,,,w "w;greater=1" |
+      csv-paste "-;binary=3ui,3d,ui" line-number |
+      csv-shuffle -b=3ui,3d,2ui -f=,,,x,y,z,,id -o=x,y,z,id >$NODES
+    # Generate edge connections
+    [[ $verbose ]] && echo "Generating edge file" >&2
+    cat $NODES | graph-edge basic --binary=3d,ui --fields=x,y,z,id --radius $radius -v >$EDGES
+  fi
+}
+
+function search_graph() {
+  start_id=$1
+  nodes=${2:-$NODES} # So I can prune them....
+
+  cat $nodes | csv-shuffle --binary=3d,ui --fields=,,,i -o=i |
+    csv-join "$EDGES;binary=2ui,d;fields=id" --binary=ui --fields=id |
+    csv-shuffle -b=ui,2ui,d -f=i -o=i |
+    csv-sort -b=ui -f=a -u | csv-from-bin ui |
+    graph-search --skip-non-existing-targets --edges "$EDGES;binary=2ui,d;fields=source,target,cost" --source $start_id 2>/dev/null
+}
+
+function process-graph() {
+  local trunkRaw=$1
+  local verbose=$2
+  # For each trunk point, run graph search
+  trunkID=$(echo "$trunkRaw" | csv-shuffle -f=x,y,z,tid,n -o=tid)
+  trunkXYZ=$(echo "$trunkRaw" | csv-shuffle -f=x,y,z,tid,n -o=x,y,z)
+
+  trunkNode=$(cat $NODES |
+    points-calc nearest --binary=3d,ui --fields=x,y,z,line --point=$trunkXYZ |
+    csv-shuffle --binary=3d,ui,d --fields=x,y,z,line,dist -o=line |
+    csv-from-bin ui)
+  echo "Trunk: $trunkXYZ" >&2
+  search_graph $trunkNode | tee temp.g.csv |
+    csv-to-bin 2ui |
+    csv-calc size --binary=2ui --fields=id --append |                      # Output: node_id, target_id, number_of_times_this_node_appears_in_paths
+    csv-calc size --binary=3ui --fields=,id --append | tee temp.g.bin |    # Output: node_id, target_id, length_of_this_path,length_of_this_path
+    csv-join --binary=5ui --fields=id "$NODES;binary=3d,ui;fields=,,,id" | # tee temp.joined.bin |
+    csv-shuffle --binary=5ui,3d,ui --fields=nid,tid,nTimes,len,,x,y,z,nid2 -o=x,y,z,nid,tid,nTimes,len
+
+  [[ $verbose ]] || echo -n "." >&2
+}
+
+function go() {
+  local pc=$1
+  local bin=$2
+  local fields=$3
+  local vs=$4
+  local radius=$5
+  local trunk=$6
+  local cores=$7
+
+  local ef=$(echo $fields | csv-fields clear)
+  local zf=$(echo $fields | csv-fields clear --except=x,y)
+  local zf2=$(echo $fields | csv-fields clear --except=z,d1 | csv-fields rename --fields=z,d1 --to=oZ,oD)
+
+  [[ $verbose ]] && echo "Generating graphs" >&2
+  # process_ground $pc $bin $fields $vs
+
+  cat $pc | gen_graph $bin $fields $vs $radius
+
+  [[ $verbose ]] && echo "Graph search..." >&2
+
+  if [[ -s temp.cand.bin ]]; then
+    echo "Skipping temp.cand.bin" >&2
+  else
+
+    cat $pc | csv-paste "-;binary=$bin" "line-number" | points-join --binary=$bin,ui --fields=$zf "$pc;binary=$bin;fields=$zf" --radius=0.05 --all |
+      csv-shuffle --binary=$bin,ui,$bin --fields=$fields,line,$zf2 -o=$fields,line,oZ,oD |
+      csv-eval --binary=$bin,ui,2d --fields=$fields,line,oZ,oD "count=where(d1 < oD, where(z > oZ, 1, 0), 0) ; count2=where(d1 > oD, where(z < oZ, 1, 0), 0)" --output-format=2ui | # Keep points higher than this voxel with a smaller d1 score, and lower than this voxel with a higher score
+      csv-calc mean,sum --binary=$bin,ui,2d,2ui --fields=$fields,id,,,count1,count2 |
+      csv-shuffle --binary=$bin,2ui,$bin,2ui,ui --fields=$fields,,,$ef,sumOfCount1,sumOfCount2 -o=x,y,z,sumOfCount1,sumOfCount2 >temp.cand.bin
+
+  fi
+  # Identify points which have a high SOC2 (i.e. causing a lot of shade)
+  # Find nodes which lead to a lot of high-SOC2 nodes
+
+  cat $pc | gen_graph $bin $fields $vs $radius
+  [[ $verbose ]] && echo "Graph search..." >&2
+  # fields=x,y,z,node_id,target_id,length_of_this_path
+  process-graph $trunk $verbose | tee temp.graphed.bin |
+    points-join --binary=3d,4ui --fields=x,y,z,nid,tid,nTimes,len "temp.cand.bin;binary=3d,2ui;fields=x,y,z,soc1,soc2" --radius=$vs --nearest | tee temp.joined.bin |
+    csv-shuffle --binary=3d,4ui,3d,2ui --fields=x,y,z,nid,tid,nTimes,len,,,,soc1,soc2 -o=x,y,z,nid,tid,len,soc1,soc2 |
+    # Use "index" to find where in a path each node appears
+    csv-blocks index --binary=3d,5ui --fields=x,y,z,,block |
+    csv-eval --binary=3d,2ui,ui,2ui,ui --fields=x,y,z,nid,tid,len,s1,s2,idx "f=where(nid==tid,s2,0)" --output-format=d |
+    csv-calc max --binary=3d,2ui,ui,2ui,ui,d --fields=,,,,id,,,,,f --append |
+    csv-calc percentile=0.75 --binary=3d,2ui,ui,2ui,ui,2d --fields=,,,,,,,s2 --append |
+    # For each node on the path to a shading node, add the proportion of the path they're at.
+    # So, nodes with a high "score" are close to the high-shading node they would remove
+    csv-eval --binary=3d,2ui,ui,2ui,ui,2d,ui --fields=x,y,z,nid,tid,len,s1,s2,idx,f,mf,ps2 "score=where(mf>ps2,double(idx)/double(len),0)" --output-format=d | tee temp.scored.bin |
+    # Aggregate results - each node is scored by how many times it's on the path to a shading node.
+    csv-calc mean,sum --binary=3d,2ui,ui,2ui,ui,2d,ui,d --fields=x,y,z,id,,,,,,,,,score |
+    csv-shuffle --binary=3d,d,3d,d,ui -f=x,y,z,,,,,ms2,id -o=x,y,z,id,ms2 | tee temp.soc.bin |
+    # Now do some funky stuff to find the "best" options
+    csv-calc max --binary=3d,ui,d --fields=,,,,s --append |
+    csv-select --binary=3d,ui,d,d --fields=x,y,z,nid,s,m "s;greater=1" |
+    csv-eval --binary=3d,ui,2d --fields=,,,,s,m "x=log(s)/log(m)" --output-format=d |
+    csv-shuffle -b=3d,ui,3d --fields=x,y,z,nid,s,m,score -o=x,y,z,nid,score |
+    csv-calc percentile=0.95 --binary=3d,ui,d --fields=,,,,score --append |
+    csv-eval --binary=3d,ui,d,d --fields=,,,,score,max "keep=where(score>max,1,0)" --output-format=ui |
+    csv-select --binary=3d,ui,2d,ui --fields=x,y,z,nid,score,p,k "k;equals=1" |
+    csv-shuffle --binary=3d,ui,2d,ui --fields=x,y,z,nid,score -o=x,y,z,nid,score | tee temp.suggestions.bin |
+    # Remove candidates too close together?
+    points-to-voxel-indices --binary=3d,ui,d --fields=x,y,z --resolution=1.5 |
+    csv-sort --binary=3d,ui,d,3ui --fields=,,,,,a,b,c --order=a,b,c |
+    csv-blocks group --binary=3d,ui,d,3ui --fields=,,,,,id,id,id |
+    csv-blocks index --binary=3d,ui,d,3ui,ui --fields=,,,,,,,,block |
+    csv-blocks index --binary=3d,ui,d,3ui,2ui --fields=,,,,,,,,block --reverse |
+    csv-select --binary=3d,ui,d,3ui,3ui --fields=x,y,z,nid,score,i,j,k,b,idx,idxr "idx;equals=0" |
+    csv-shuffle -b=3d,ui,d,3ui,3ui -f=x,y,z,nid,score -o=x,y,z,nid,score | # tee temp.pasted.bin |
+    # Remove candidates close to the trunk (though len should take care of this)
+    csv-paste "-;binary=3d,ui,d" "value=$trunk;binary=3d" |
+    points-calc distance --binary=3d,ui,d,3d --fields=first,a,b,second |
+    csv-select --binary=3d,ui,d,3d,d --fields=x,y,z,nid,sc,tx,ty,tz,dist "dist;greater=1" |
+    csv-shuffle -b=3d,ui,d,3d,d -f=x,y,z,nid,score -o=x,y,z,nid,score #|
+  # view-points "-;binary=3d,ui,d;fields=x,y,z,,scalar;colour=0:1,jet;weight=25" "temp.cand.bin;binary=3d,2ui;fields=x,y,z;colour=green" --background-color=white
+
+  [[ $verbose ]] || echo "!" >&2
+}
+
+function go_graphonly() {
+  local pc=$1
+  local bin=$2
+  local fields=$3
+  local vs=$4
+  local radius=$5
+  local trunk=$6
+  local cores=$7
+
+  local ef=$(echo $fields | csv-fields clear)
+
+  [[ $verbose ]] && echo "Generating graphs" >&2
+
+  cat $NO_GND | gen_graph $bin $fields $vs $radius
+
+  [[ $verbose ]] && echo "Graph search..." >&2
+
+  process-graph $trunk $verbose |
+    signed-distance --binary=3d,2ui --fields=,,,,x |                         # 1st derivative of node utility
+    signed-distance --binary=3d,2ui,d --fields=,,,,,x | tee temp.diffs.bin | # 2nd derivative of node utility
+    csv-eval --binary=3d,2ui,2d --fields=,,,,n,,d "d=d/n" | csv-calc mean --binary=3d,2ui,2d --fields=x,y,z,id,,,d |
+    csv-calc percentile=0.025 --binary=3d,d,ui --fields=,,,d --append |
+    csv-eval --binary=3d,d,ui,d --fields=,,,d,,p "o=where(d<p,1,0)" --output-format=ui |
+    csv-select --binary=3d,d,ui,d,ui --fields=,,,d,,,o "o;equals=1" |
+    csv-shuffle -b=3d,d,ui,d,ui -f=x,y,z,d,nid,p,o -o=x,y,z,nid,d | # tee temp.boooooo.bin |
+    points-to-voxels --binary=3d,ui,d --fields=x,y,z --resolution=2 |
+    csv-shuffle -b=3ui,3d,ui --fields=i,j,k,x,y,z,w -o=x,y,z |
+    csv-paste "-;binary=3d" "line-number" | tee temp.candidates.bin |
+    view-points "temp.tree.bin;binary=3d,2ui;fields=x,y,z,cl,seg" "-;binary=3d,ui;fields=x,y,z,id;weight=30"
+
+  max=$(cat temp.graph.bin | csv-calc percentile=0.95 --binary=3d,2ui,d --fields=,,,,,s | csv-from-bin ui)
+
+  [[ $verbose ]] || echo "!" >&2
+}
+
+function option-description() {
+  cat <<eof
+--binary=[<format>]; default=3d,2ui,2d,3d; Binary format used in point cloud
+--fields=[<fields>]; default=x,y,z,cl,seg,light_a,light_b,d1,d2,d3; Point cloud fields, must include "x,y,z,d1"
+--trunk=[<point>]; default=0,0,0; Location of trunk
+--voxel-size=[<size>]; default=0.2; voxel size to use to speed up computation.
+--radius=[<radius>]; default=0.3; radius to use for graph edge computation.
+--percentile=[<percentile>]; default=0.5; percentile to use in classification
+--cores=[<cores>]; default=4; Number of cores to use when parallelising.
+--verbose, -v; Output progress to stderr
+--show, -s; Show results using view-points
+eof
+}
+
+function usage() {
+  cat <<eof
+
+$name takes a point cloud and suggests points at which you can prune it.
+Input should be a pointcloud containing a single tree with no ground, and it will work better if it's only the trunk.
+
+usage: $name <operation> <point_cloud> [options]
+
+options: $(option-description | sed 's/^/    /g')
+
+example usage:
+  $name /mnt/data/pruning/zebbed/28756/0-cut/28756.bin --binary=3d,2ui --fields=x,y,z,c,i -v -s > output.bin
+
+eof
+  exit 1
+}
+
+if (($(comma_options_has --help $@) || $(comma_options_has -h $@))); then usage; fi
+options=$(option-description | comma-options-to-name-value "$@") || error "invalid command line options"
+comma_path_value_to_var --prefix="options" <<<"$options"
+eval "$(option-description | comma-options-to-name-value "$@" | comma_path_value_mangle)"
+
+# set -e # Kill if anything errors out; we don't want it to run everything on bad datasets
+
+export readonly TEMPDIR=$(mktemp -d)
+echo "Tempomary directory $TEMPDIR" >&2
+
+export readonly NO_GND=$TEMPDIR/nognd.bin
+export readonly NODES=$TEMPDIR/nodes.bin
+export readonly EDGES=$TEMPDIR/edges.bin
+export readonly CANDS=$TEMPDIR/candidates.bin
+
+function cleanup() {
+  echo "CLEANING UP $TEMPDIR" >&2
+  rm -rf $TEMPDIR
+  exit
+}
+
+trap cleanup EXIT
+trap cleanup INT
+
+(($(comma_options_has --verbose "$@"))) && export readonly verbose=true
+(($(comma_options_has --show "$@"))) && export readonly show=true
+
+go $1 $options_binary $options_fields $options_voxel_size $options_radius $options_trunk $options_cores

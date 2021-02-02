@@ -1,0 +1,58 @@
+readonly no_trace=true
+(( $( comma_options_has --avoid-trace "$@" ) )) && export readonly avoid_trace=true
+
+(( $( comma_options_has --start-date "$@" ) )) || { echo "--start-date required" >&2 && exit; }
+(( $( comma_options_has --end-date "$@" ) )) || { echo "--end-date required" >&2 && exit; }
+set -e # Kill if anything errors out; we don't want it to run everything on bad datasets
+
+[[ $options_trace_date == "NONE" ]] && options_trace_date=$options_start_date
+
+go $1 $options_start_date $options_end_date $options_repeats $options_output_dir $options_latitude $options_longitude $options_utc_offset $options_coeff $options_voxel_size $options_voxel_weight $options_step_date $options_step_hours $options_weather_file $options_row $options_tree $options_from $options_raw_data $options_trace_date	corr=$(echo -e "0,0,0\n6,0,0\n0,11,0\n6,11,0")
+
+	cepto-subgrid "$postsSorted" "$corr" "$offset" |
+		csv-shuffle --fields=s,i,seg,x,y,z,cid --output-fields=x,y,z,cid
+}
+
+
+
+function option-description
+{
+    cat <<eof
+--post-file=[<file>]; default="posts.csv"; File containing pre-calculated post locations (or location to save this file)
+--bin=[<format>]; default=3d,ui; binary fields of input point cloud
+--fields=[<fields>]; default=x,y,z,trunk; fields of input point cloud; must include x,y,z
+--offset=[<offset>]; default="0,0,0,0,0,0"; Fixed offset (x,y,z,roll,pitch,yaw) to move cepto grid globally
+eof
+}
+
+function usage
+{
+    cat <<eof
+
+$name Locates the ceptometer points within a given point cloud
+
+usage: $name <pc> [options]
+	
+positional argument:
+point_cloud=<file>; binary point cloud containing visible ceptometer stakes to which the grid should be aligned. 
+
+
+options:
+$( option-description  | sed 's/^/    /g' )
+
+eof
+    exit 1
+}
+
+if (( $( comma_options_has --help $@ ) || $( comma_options_has -h $@ ) )) ; then usage ; fi
+options=$( option-description | comma-options-to-name-value "$@" ) || error "invalid command line options"
+comma_path_value_to_var --prefix="options" <<< "$options"
+eval "$( option-description | comma-options-to-name-value "$@" | comma_path_value_mangle )"
+
+(( $( comma_options_has --use-energy "$@" ) )) && export readonly use_energy=true
+
+set -e # Kill if anything errors out; we don't want it to run everything on bad datasets
+
+echo $options_fields | csv-fields has --fields x,y,z || error "Missing fields x,y,z"
+
+go $1 $options_bin $options_fields $options_offset $options_post_file

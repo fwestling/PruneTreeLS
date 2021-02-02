@@ -1,0 +1,69 @@
+te that file)
+--size-north=[<length>]; default=44; number of metres to generate (North). (40)
+--size-east=[<length>]; default=38; number of metres to generate (East). (36)
+--spacing-north=[<length>]; default=10; [orchard] number of metres between trees (North)
+--spacing-east=[<length>]; default=6; [orchard] number of metres between trees (East)
+--max-height=[<height>]; default=10; Maximum size (m) of generated trees
+--min-height=[<height>]; default=4; Maximum size (m) of generated trees
+--frame=[<frame>]; default="-1.5,5,0,0,0,$(math-deg2rad 95)"; Reference frame in which the trajectory is, relative to point cloud convention.
+--noise=[<stdev>]; default=0.02; noise level (stdev of gaussian distribution)
+--verbose, -v; Output progress to stderr
+--force, -f; Force recomputation of elements rather than using saved files (for when you change parameters)
+eof
+}
+
+function usage
+{
+    cat <<eof
+
+$name uses tree and LiDAR definitions to procedurally generate a point cloud
+as if the defined sensor had scanned a set of random trees of the given species.
+Outputs the finished point cloud to STDOUT.
+Also creates a temporary directory to store intermediate files.
+
+usage: $name <operation> [options]
+
+<operation>:
+  sensor
+    Visualise the sensor trajectory against a procedurally generated PC.
+  orchard
+    Generate a point cloud in an orchard setting (gridded trees, north-east aligned)
+  forest
+    Generate a point cloud in a forest setting (randomly placed trees)
+options:
+$( option-description  | sed 's/^/    /g' )
+
+eof
+    exit 1
+    
+}
+
+if [ "$1" = "-parallel" ]; then
+    shift 1
+    sample_sensor "$@"
+    exit $?
+fi
+
+
+if (( $( comma_options_has --help $@ ) || $( comma_options_has -h $@ ) )) ; then usage ; fi
+options=$( option-description | comma-options-to-name-value "$@" ) || error "invalid command line options"
+comma_path_value_to_var --prefix="options" <<< "$options"
+eval "$( option-description | comma-options-to-name-value "$@" | comma_path_value_mangle )"
+
+(( $( comma_options_has --verbose "$@" ) )) && export readonly verbose=true
+(( $( comma_options_has --force "$@" ) )) && export readonly recompute=true
+
+set -e # Kill if anything errors out; we don't want it to run everything on bad datasets
+
+export TEMPDIR="~/data/gpc_temp"
+mkdir -p $TEMPDIR
+
+if [[ "$1" = "sensor" ]]
+then
+  go_sensor $options_arbaro $options_trajectory $options_sensor $options_frame $options_size_north $options_size_east $options_noise
+elif [ "$1" = "orchard" -o "$1" = "forest" ]
+then
+  go $options_arbaro $options_trajectory $options_sensor $options_size_north $options_size_east $options_spacing_north $options_spacing_east $1 $options_max_height $options_min_height $options_frame $options_noise
+else
+  error "Unknown operation \"$1\""
+fi

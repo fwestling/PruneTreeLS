@@ -1,0 +1,27 @@
+#!/usr/bin/python
+import sys
+import subprocess
+
+from scipy.optimize import minimize
+
+
+class alignment(object):
+    def __init__(self, A, B):
+        self.A = A
+        self.B = B
+
+    def opt(self, arg):
+        x=",".join(map(str,arg))
+        sys.stderr.write("(%s) => " %(x))
+        o=subprocess.check_output("measure-alignment %s %s --binary=3d,ui --fields=x,y,z,trunk --transform=%s" % (self.A, self.B, x), shell=True)
+        sys.stderr.write("%s" %(o))
+        return o
+
+pc_a = sys.argv[1]
+pc_b = sys.argv[2]
+
+obj = alignment(pc_a, pc_b)
+
+x0 = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+res = minimize(obj.opt, x0, method='Nelder-Mead', tol=1e-6)
+print res.x

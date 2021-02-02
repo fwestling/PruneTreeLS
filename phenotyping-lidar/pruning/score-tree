@@ -1,0 +1,108 @@
+#!/bin/bash
+
+# Given a cut point and a trunk point, removes all matter above the cut.
+
+export readonly name=$(basename $0)
+
+source $(type -p comma-application-util) || (error "comma not installed")
+function errcho() { (echo >&2 "$name: $1"); }
+function error() {
+    errcho "error: $1"
+    exit 1
+}
+
+function go() {
+    local pc=$1
+    local bin=$2
+    local fields=$3
+    local vs=$4
+    local tout=$5
+
+    cf=$(echo $fields | csv-fields clear)
+    tidf=$(echo $fields | csv-fields rename --fields=tid --to=id)
+    ctidf=$(echo $fields | csv-fields rename --fields=tid --to=id | csv-fields clear --except=id)
+    scf=$(echo $fields | csv-fields rename --fields=tid --to=id | csv-fields clear --except=light_a,id)
+    xf=$(echo $fields | csv-fields clear --except=x)
+    db=$(echo $bin | csv-format expand | sed 's/ui/d/g' | csv-format collapse)
+
+    [[ $verbose ]] && echo "Computing full sun:" >&2
+    fullsun=$(cat $pc | csv-calc percentile=1 --binary=$bin --fields=$(echo $fields | csv-fields clear --except=light_a) | csv-eval --binary=d --fields=lm "lm=(lm/0.8)" | csv-from-bin d)
+    # All voxels should ideally get 25% of full sun
+
+    [[ $verbose ]] && echo "$fullsun" >&2
+
+    # Calculate volume
+    [[ $verbose ]] && echo "Calculating volume:" >&2
+
+    # cat $pc | compute-volume smartslices --binary=$bin --fields=$(echo $fields | csv-fields rename --fields=tid --to=id) --size=$vs 2>/dev/null | sed 's/,$//' | csv-to-bin ui,d >temp_base_vol.bin
+    cat $pc | compute-volume voxhull --binary=$bin --fields=$(echo $fields | csv-fields rename --fields=tid --to=id) --size=$vs 2>/dev/null | sed 's/,$//' | csv-to-bin ui,d >temp_base_vol.bin
+
+    [[ $verbose ]] && cat temp_base_vol.bin | csv-from-bin ui,d >&2
+
+    [[ $verbose ]] && echo "Scoring..." >&2
+    cat $pc |
+        points-to-voxel-indices --binary=$bin --fields=$fields --resolution=$vs |
+        csv-sort --binary=$bin,3ui --fields=$cf,a,b,c --order=a,b,c |
+        csv-blocks group --binary=$bin,3ui --fields=$cf,id,id,id |
+        csv-calc mean --binary=$bin,4ui --fields=$fields,,,,id |
+        csv-shuffle -b=$bin,ui -f=$fields -o=$fields |
+        # csv-eval --binary=$bin --fields=$fields "p=light_a/$fullsun;d1=where(p<0.25,0,1);d2=where(light_a<0.25,-(p*p),log(p+1))" --output-fields=p,d1,d2 --output-format=d | tee $tout |
+        # csv-eval --binary=$bin --fields=$fields "p=(light_a/0.8)/$fullsun;d1=where(p<0.25,0,1);d2=where(light_a<0.25,-(p*p),p)" --output-fields=p,d1,d2 --output-format=d | tee $tout |
+        # csv-eval --binary=$bin --fields=$fields "p=(light_a/0.8)/$fullsun;d1=where(p<0.25,0,1);d2=where(light_a<0.25,p-0.25,log(p+1)-0.1)" --output-fields=p,d1,d2 --output-format=d | tee $tout |
+        csv-eval --binary=$bin --fields=$fields "p=(light_a/0.8)/$fullsun;d1=where(p<0.25,0,1);d2=where(light_a<0.25,-(0.5-p)*(0.5-p),log(p+1))" --output-fields=p,d1,d2 --output-format=d | tee $tout |
+        if [[ $show ]]; then
+            tee >(view-points "-;binary=$bin,3d;fields=$fields,scalar;colour=0:0.25,jet;weight=4" --background-color=white)
+        else
+            cat
+        fi |
+        # tee >(csv-shuffle -b=$bin,ui,2d,ui,2d -f=$fields,npts,volume,density,id -o=light_a,volume | csv-from-bin d,d >temp_means.csv) |
+        csv-calc sum,mean --binary=$bin,3d --fields=$scf,d1,d2,d3 |
+        csv-join --fields=,,,,,,,,id --binary=8d,ui "temp_base_vol.bin;binary=ui,d;fields=id,v" |
+        csv-shuffle --binary=8d,ui,ui,d --fields=sla,sd1,sd2,sd3,mla,md1,md2,md3,id,,vol -o=id,md3,vol,sla | csv-from-bin ui,3d
+    rm temp_base_vol.bin
+}
+
+function option-description() {
+    cat <<eof
+--binary=[<format>]; default=3d,2ui,2d; Binary format used in point cloud
+--fields=[<fields>]; default=x,y,z,cl,tid,light_a,light_b; Point cloud fields, must include "x,y,z"
+--voxel-size=[<size>]; default=0.05; voxel size to use when doing voxel operations.
+--output-scored=[<file>]; default=temp.scored; Location to save the scored version.
+--alpha=[<coefficient>]; default=1.1; Coefficient of D Score in final calculation.
+--beta=[<coefficient>]; default=0.45; Coefficient of light differential in final calculation.
+--gamma=[<coefficient>]; default=0.11; Coefficient of volume differential in final calculation. 
+--verbose, -v; Output progress to stderr
+--show, -s; Show results using view-points
+eof
+}
+
+function usage() {
+    cat <<eof
+
+$name takes a point cloud of a raytraced tree and scores it.
+Outputs a total score to stdout
+
+Positional argument: Point cloud to measure, "full" (not voxelised)
+
+usage: $name [<point_cloud>] [options]
+
+options:
+$(option-description | sed 's/^/    /g')
+
+example usage:
+  $name avo_md.bin --binary=3d,2ui,2d --fields=x,y,z,cl,tid,light_a,light_b -v -s
+
+eof
+    exit 1
+}
+
+if (($(comma_options_has --help $@) || $(comma_options_has -h $@))); then usage; fi
+options=$(option-description | comma-options-to-name-value "$@") || error "invalid command line options"
+comma_path_value_to_var --prefix="options" <<<"$options"
+eval "$(option-description | comma-options-to-name-value "$@" | comma_path_value_mangle)"
+
+(($(comma_options_has --verbose "$@"))) && export readonly verbose=true
+
+set -e # Kill if anything errors out; we don't want it to run everything on bad datasets
+
+go $1 $options_binary $options_fields $options_voxel_size $options_output_scored

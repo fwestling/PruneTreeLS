@@ -1,0 +1,183 @@
+#!/bin/bash
+
+# Performs an operation to a point cloud using graph search methods
+
+source $(type -p comma-application-util) || (error "comma not installed")
+function errcho() { (echo >&2 "$name: $1"); }
+function error() {
+  errcho "error: $1"
+  exit 1
+}
+
+function raytrace() {
+  PC=$1
+  binary=$2
+  fields=$3
+
+  cf=$(echo $fields | csv-fields clear)
+
+  OUT=temp.raytraced.voxelised.bin
+  cat $PC |
+    csv-select --binary=$binary --fields=$fields "tid;greater=0" |
+    filter-voxweight - --binary=$binary --fields=$fields --voxel-size=0.1 --threshold=1 |
+    thin-pointcloud - --binary=$binary --fields=$fields --voxel-size=0.05 |
+    raytrace-pc - --binary=$binary --fields=$fields --cores=15 --sky=$SKY --raytrace-size=0.05 --beta=0.80 --verbose >$OUT
+  cat $PC |
+    points-join --binary=$binary --fields=$fields "$OUT;binary=$binary,2d" --radius=0.1 --nearest |
+    csv-shuffle -b=$binary,$binary,2d --fields=$fields,$cf,la,lb -o=$fields,la,lb
+
+}
+
+function go() {
+  PC=$1
+  bin=$2
+  fields=$3
+  vs=$4
+  rad=$5
+  trunk=$6
+  cores=$7
+
+  name=$(echo $PC | egrep -o "[^\/]*.bin" | sed 's/\.bin//')
+
+  [[ $verbose ]] && echo "bin: $bin" >&2
+  [[ $verbose ]] && echo "fields: $fields" >&2
+  [[ $verbose ]] && echo "vs: $vs" >&2
+  [[ $verbose ]] && echo "rad: $rad" >&2
+
+  echo $trunk >trunk-fake.csv
+
+  mkdir -p scored
+  SCORED="scored/$name.bin"
+
+  mkdir -p raytraced
+  RAYTRACED="raytraced/$name-uncut.bin"
+
+  mkdir -p cuts
+  CUTS="cuts/$name.bin"
+
+  [[ $verbose ]] && echo "Sky" >&2
+  # Make sky if we don't have it already
+  SKY=temp.sky.csv
+  [[ -f $SKY ]] || gen-sky --repeats=5 --sdate=20180101 --edate=20190101 --longitude=145.422600 --latitude=-17.133312 --verbose 2>/dev/null >$SKY
+
+  # Raytrace tree
+  [[ $verbose ]] && echo "Raytrace base" >&2
+  [[ -s $RAYTRACED ]] || raytrace $PC $bin $fields >$RAYTRACED
+
+  # # Get full tree
+  # [[ -s $FULL ]] || cat $ref |
+  #   points-join --binary=3d,2ui --fields=x,y,z "$PC;binary=$bin;fields=$fields" --radius=0.2 --nearest |
+  #   csv-shuffle -b=3d,2ui,$bin --fields=,,,,,$fields -o=x,y,z,cl,tid >$FULL
+
+  [[ $verbose ]] && echo "Scoring base tree" >&2
+  echo "id,mean_d3,vol,sum_la" >scores.$name.csv
+  [[ -s $SCORED ]] || score-tree $RAYTRACED --output-scored=$SCORED | sed 's/^/full,/' >scores.$name.csv
+
+  # Compute base stats
+  # base_vol=$(cat $FULL | compute-volume smartslices --binary=3d,2ui --fields=x,y,z,cl,tid --size=$vs 2>/dev/null)
+  # base_la=$(cat $SCORED | csv-calc sum --binary=$bin,3d --fields=$(echo $fields | csv-fields clear),la | csv-from-bin d)
+  # base_score=$(cat $SCORED | csv-calc mean --binary=$bin,3d --fields=$(echo $fields | csv-fields clear),d2 | csv-from-bin d)
+  # echo "Base statistics: V = $base_vol m^3, la = $base_la, d1 = $base_score" >&2
+
+  # # Get trunk-only tree
+  # [[ -s $TRUNK ]] || cat $SCORED | csv-select --binary=$bin,3d --fields=$(echo $fields | csv-fields clear --except=cl) "cl;greater=1" >$TRUNK
+
+  [[ $verbose ]] && echo "Getting candidate points" >&2
+  [[ $verbose ]] && echo "identify-prune-points $SCORED --trunk=$trunk --binary=$bin,2d,3d --fields=$fields,light_a,light_b,d1,d2,d3 " >&2
+  # Get candidate points
+  [[ -s $CUTS ]] || identify-prune-points $SCORED --trunk $trunk --binary=$bin,2d,3d --fields=$fields,light_a,light_b,d1,d2,d3 --voxel-size=$vs --radius=$rad |
+    csv-shuffle -b=3d,ui,d -f=x,y,z -o=x,y,z | csv-paste "-;binary=3d" "line-number" | csv-from-bin 3d,ui | head -9 | csv-to-bin 3d,ui >$CUTS # | csv-thin 0.5 --binary=3d | csv-paste "-;binary=3d" "line-number" >$CUTS
+
+  [[ $verbose ]] && echo "Pruning clouds" >&2
+  # Create pruned clouds
+  mkdir -p pruned
+  cat $CUTS | csv-from-bin 3d,ui | while read line; do
+    pid=$(echo "$line" | cut -d, -f4)
+    xyz=$(echo "$line" | cut -d, -f1-3)
+
+    echo $xyz >temp.cut.csv
+    [[ $verbose ]] && echo "$pid: $xyz" >&2
+    [[ -s pruned/$name.$pid.bin ]] || graph-op prune $PC --binary=$bin --fields=$fields --cuts=temp.cut.csv --trunks=trunk-fake.csv --radius 0.3 --voxel-size=0.2 >pruned/$name.$pid.bin
+    rm temp.cut.csv
+  done
+
+  [[ $verbose ]] && echo "All cuts" >&2
+  cat $CUTS | csv-from-bin 3d,ui | cut -d, -f1-3 >temp.cut.csv
+  [[ -s pruned/$name.all.bin ]] || graph-op prune $PC --binary=$bin --fields=$fields --cuts=temp.cut.csv --trunks=trunk-fake.csv --radius 0.3 --voxel-size=0.2 >pruned/$name.all.bin
+
+  [[ $verbose ]] && echo "Raytracing pruned clouds" >&2
+  # Raytrace pruned clouds
+  mkdir -p pruned/raytraced
+  for f in pruned/$name.*; do
+    pid=$(echo $f | egrep -o "[^.]*\.bin" | sed 's/\.bin//')
+    [[ $verbose ]] && echo "$pid" >&2
+
+    [[ -s pruned/raytraced/$name.$pid.bin ]] || raytrace $f $bin $fields >pruned/raytraced/$name.$pid.bin
+  done
+
+  [[ $verbose ]] && echo "Scoring pruned clouds" >&2
+  # Score raytraced clouds
+  mkdir -p pruned/scored
+  for f in pruned/raytraced/$name.*; do
+    pid=$(echo $f | egrep -o "[^.]*\.bin" | sed 's/\.bin//')
+    [[ $verbose ]] && echo "$pid" >&2
+    # [[ -s pruned/scored/$name.$pid.bin ]] ||
+    score-tree $f --binary=$bin,2d --fields=$fields,light_a,light_b --output-scored=pruned/scored/$name.$pid.bin |
+      sed "s/^/$pid,/"
+  done >>scores.$name.csv
+
+}
+
+function option-description() {
+  cat <<eof
+--binary=[<format>]; default=3d,2ui; Binary format used in point cloud
+--fields=[<fields>]; default=x,y,z,cl,tid; Point cloud fields
+--trunk=[<point>]; default=0,0,0; Location of trunk
+--voxel-size=[<size>]; default=0.2; voxel size to use to speed up computation.
+--radius=[<radius>]; default=0.3; radius to use for graph edge computation.
+--verbose, -v; Output progress to stderr
+--show, -s; Show results using view-points
+eof
+}
+
+function usage() {
+  cat <<eof
+
+$name takes a tree point cloud and suggests an ideal pruning location
+Input should be a pointcloud containing a single tree with no ground
+
+usage: $name <point_cloud> [options]
+
+options: $(option-description | sed 's/^/    /g')
+
+example usage:
+  $name /mnt/data/pruning/zebbed/28756/0-cut/28756.bin --binary=3d,2ui --fields=x,y,z,c,i -v -s > output.bin
+
+eof
+  exit 1
+}
+
+if (($(comma_options_has --help $@) || $(comma_options_has -h $@))); then usage; fi
+options=$(option-description | comma-options-to-name-value "$@") || error "invalid command line options"
+comma_path_value_to_var --prefix="options" <<<"$options"
+eval "$(option-description | comma-options-to-name-value "$@" | comma_path_value_mangle)"
+
+# set -e # Kill if anything errors out; we don't want it to run everything on bad datasets
+
+export readonly TEMPDIR=$(mktemp -d)
+echo "Tempomary directory $TEMPDIR" >&2
+
+# TRUNKS=$TEMPDIR/trunks.bin
+
+function cleanup() {
+  echo "CLEANING UP $TEMPDIR" >&2
+  rm -rf $TEMPDIR
+  exit
+}
+
+trap cleanup EXIT
+trap cleanup INT
+
+(($(comma_options_has --verbose "$@"))) && export readonly verbose=true
+(($(comma_options_has --show "$@"))) && export readonly show=true
+go $1 $options_binary $options_fields $options_voxel_size $options_radius $options_trunk $options_cores

@@ -1,0 +1,87 @@
+#!/bin/bash
+
+## filter-voxweight
+## Filters a given point cloud by a minimum weight threshold at a given voxel size
+## It works, but is pretty slow
+
+export readonly name=$( basename $0 )
+
+source $( type -p comma-application-util ) || (error "comma not installed")
+function errcho { (>&2 echo "$name: $1") }
+function error
+{
+    errcho "error: $1"
+    exit 1
+}
+
+function go () {
+	local bin=$1
+	local fields=$2
+	local v_size=$3
+	local w_thresh=$4
+
+	# echo "$w_thresh" >&2
+
+	if [[ $flag ]] 
+	then
+		# echo "Flagging" >&2
+		cat | csv-paste "-;binary=$bin" line-number | # Have to maintain order!
+			points-to-voxel-indices --binary=$bin,ui --fields=$fields --resolution=$v_size | 
+			csv-sort --binary=$bin,ui,3ui --fields=$fields,,temp/i,temp/j,temp/k --order=temp/i,temp/j,temp/k | 
+			csv-blocks group --binary=$bin,ui,3ui --fields=$fields,,id,id,id | 
+			csv-calc size --binary=$bin,ui,4ui --fields=$(echo "$fields" | csv-fields clear),,x,,,id --append | 
+			csv-eval --binary=$bin,ui,3ui,2ui --fields=$fields,,,,,,w "keep=where(w>$w_thresh,1,0)" --output-format=ui | #tee temp.bin | 
+			csv-sort --binary=$bin,ui,3ui,3ui --fields=$(echo "$fields" | csv-fields clear),a |
+			csv-shuffle --binary=$bin,ui,3ui,3ui --fields=$fields,,,,,,,added/keep -o $fields,added/keep  
+	else
+		# echo "Not Flagging" >&2
+		cat | csv-paste "-;binary=$bin" line-number | # Have to maintain order!
+			points-to-voxel-indices --binary=$bin,ui --fields=$fields --resolution=$v_size | 
+			csv-sort --binary=$bin,ui,3ui --fields=$fields,,temp/i,temp/j,temp/k --order=temp/i,temp/j,temp/k | 
+			csv-blocks group --binary=$bin,ui,3ui --fields=$fields,,id,id,id | 
+			csv-calc size --binary=$bin,ui,4ui --fields=$(echo "$fields" | csv-fields clear),,x,,,id --append | 
+			csv-select --binary=$bin,ui,3ui,2ui --fields=$fields,,,,,,w "w;greater=$w_thresh" | 
+			csv-sort --binary=$bin,ui,3ui,2ui --fields=$(echo "$fields" | csv-fields clear),a |
+			csv-shuffle --binary=$bin,ui,3ui,2ui --fields=$fields -o $fields  
+	fi
+}
+
+
+function option-description
+{
+    cat <<eof
+--voxel-size=[<size>]; default=0.1; Voxel size at which weight is measured
+--threshold=[<weight>]; default=4; Minimum number of points allowed for a voxel to remain
+--binary=[<binary>]; default=3d; Binary format of input file 
+--fields=[<fields>]; default=x,y,z; Fields of input file. Must include x,y,z and cannot include "id"
+--flag, -f; Flag elements to remove rather than removing it
+eof
+}
+
+function usage
+{
+    cat <<eof
+
+$name Thins down and regularises a point cloud by voxelising at given sizes with a weight limit.
+
+usage: cat file | $name [options]
+	
+options:
+$( option-description  | sed 's/^/    /g' )
+
+eof
+    exit 1
+}
+
+if (( $( comma_options_has --help $@ ) || $( comma_options_has -h $@ ) )) ; then usage ; fi
+options=$( option-description | comma-options-to-name-value "$@" ) || error "invalid command line options"
+comma_path_value_to_var --prefix="options" <<< "$options"
+eval "$( option-description | comma-options-to-name-value "$@" | comma_path_value_mangle )"
+
+(( $( comma_options_has --flag "$@" ) )) && export readonly flag=true
+
+set -e # Kill if anything errors out; we don't want it to run everything on bad datasets
+
+echo $options_fields | csv-fields has --fields x,y,z || error "Missing fields x,y,z"
+
+go $options_binary $options_fields $options_voxel_size $options_threshold 

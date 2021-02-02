@@ -1,0 +1,46 @@
+#!/bin/bash
+
+# Binary point cloud on stdin, arguments:
+# 	bin, fields, degrees to rotate
+
+bin=$1
+fields=$2
+deg=$3
+
+[[ $deg == 0 ]] && cat && exit
+
+zFields=`echo "$fields" | csv-fields clear --except=z`
+xyzFields=`echo "$fields" | csv-fields clear --except=x,y,z`
+compFields=`echo "$xyzFields" | csv-fields rename --fields=x,y,z --to=first/x,first/y,`
+pc=`cat | base64`
+minmax=`echo -n "$pc" | base64 -d | csv-calc min,max --binary=$bin --fields=$zFields | csv-from-bin 2d`
+min=`echo "$minmax" | cut -d, -f1`
+max=`echo "$minmax" | cut -d, -f2`
+
+
+### This code isolates the 'tree' (in a very basic way) from everything around it
+mean=`echo -n "$pc" | base64 -d | csv-calc mean --binary=$bin --fields=$xyzFields | csv-from-bin 3d`
+
+echo -n "$pc" | base64 -d | csv-paste "-;binary=$bin" "value=$mean;binary=3d" |
+ points-calc distance --binary=$bin,3d --fields=$compFields,second/x,second/y | tee dist.tmp | 
+ csv-select --binary=$bin,3d,d --fields=$fields,xx,yy,zz,dist "dist;less=5" | 
+ csv-shuffle --binary=$bin,3d,d --fields=$fields --output-fields=$fields > tree.tmp
+
+cat dist.tmp | csv-select --binary=$bin,3d,d --fields=$fields,xx,yy,zz,dist "dist;greater=5" | 
+ csv-shuffle --binary=$bin,3d,d --fields=$fields --output-fields=$fields > notree.tmp
+
+### Now we take just the tree of interest and rotate it by the desired number of degrees.
+invMean=`echo $mean | csv-eval --fields=x,y,z "x=-x;y=-y;z=-z"`
+
+cat tree.tmp | points-frame --binary=$bin --fields=$xyzFields --from="$invMean" |
+points-frame --binary=$bin --fields=$xyzFields --from="0,0,0,0,0,$(math-deg2rad $deg)" |
+points-frame --binary=$bin --fields=$xyzFields --from="$mean" > treerot.tmp
+
+### View results for debugging purposes
+
+#view-points --binary=$bin --fields=$fields --colour=$min:$max "notree.tmp" "tree.tmp" "treerot.tmp"
+
+### Output new point cloud
+cat notree.tmp treerot.tmp
+
+rm tree.tmp notree.tmp dist.tmp treerot.tmp

@@ -1,0 +1,193 @@
+Hello!
+
+There are lots of scripts here, and they can do some useful things, but you need to know how to use them.
+
+NB: Currently, there are references to /home/fwes7558 all over the files here...this has to be adjusted for them to work on your system.
+
+===========================================
+ To prepare new LiDAR files (from Zebedee)
+===========================================
+
++------------+
+  1. Process
++------------+
+  The Zebedee produces output that must be processed by GeoSLAM software.  Instructions come with the sensor.
+  Once that process finishes, .laz files are produced that can be extracted with LasZIP software or similar.
+  The extracted output is in the form of .las files (and others) that can be converted to .bin with the following pipeline:
+  $ cat x.las | las-to-csv points | csv-shuffle --fields=x,y,z --output-fields=x,y,z | csv-to-bin 3d > x.bin
+
++-----------------+
+  2. Georeference
++-----------------+
+  Old method: Use the label-trunks.sh script to georeference Zebedee point clouds (with local frame) to Shrimp point clouds (with global frame)
+  This approach is a little unstable, and only works on the original 18 data trees.
+  A new method has been defined which allows you to align any point cloud to any other, by manually selecting matching geometric features.
+  The utility is called `georeference`, and takes in two point clouds with the same (user-defined) binary format and fields.
+  $ georeference velodyne.bin zebedee.bin --binary=3d --fields=x,y,z > aligned.bin
+
+  This utility can take any number of matching keypoints, as long as they are provided in the same order.
+
++----------+
+  3. Label
++----------+
+  Use the label.sh utility to manually label trunk points in any given point cloud with 3d format (x,y,z).
+  Note: Currently, this utility can only use absolute filenames.  This is a pain, but hasn't been fixed yet.
+  $ label.sh /home/data/x.bin > x-labelled.bin
+
+===================================
+ To raytrace any given point cloud
+===================================
+A set of utilities has been developed (in the "utilities" folder) to perform generic raytrace operations.
+These make it possible to generate a pipeline for raytracing without needing specific directory structures.
+It is also possible to correlate raytrace results with ceptometer measurements using these utilities.
+A complete pipeline for this process, with arguments and comments, is provided in the "process" utility.
+$ find cepto-data/processed/ | egrep "\-[0-9]{4}\.csv" | xargs -n 1 -P 1 ~/src/tree-crops/light-interception/utilities/process
+
+The key steps for raytracing any point cloud are as follows:
+
++-----------------------+
+  1. Generate sky model
++-----------------------+
+  The "gen-sky" utility is a wrapper for Samuel Orn's SkyGenerator to generate irradiance-loaded sky models.
+
+  Using this utility, it's easy to generate a sky model at a given time/date/location.
+  $ gen-sky --repeats=5 --time=1027 --sdate=20170905 --no-snap > sky.csv
+  Note: "repeats" controls the sky complexity non-linearly.
+    2 repeats => 19 nodes, 8 => 314, 20 => 1982
+
+  --no-sky puts the direct component of solar irradiance at the exact position of the sun,
+    as opposed to snapping it to the nearest regular node.  The direct component is often the
+    main component (at least in our validation experiments), so this makes a 19-node sky
+    as good as a 2000-node sky quantitatively.
+
+  You can also easily generate a sky over any date interval:
+  $ gen-sky --repeats=5 --sdate=20161215 --edate=20170905 > sky-int.csv
+
+  NOTE: If you use --no-sky for an interval sky, you add a new node at every time interval (default half hour).
+  This makes the size of the sky grow linearly with the length of the interval.  For a growing season, this could lead
+  to a sky with upwards of 10,000 nodes.
+
+  If you want to view the sky (for instance, with the point cloud it raytraced), you can output it in cartesian
+  coordinates instead.
+  $ gen-sky --repeats=5 --sdate=20161215 --edate=20170905 --cartesian --radius=5 > sky-cart.csv
+  Note that this uses the North-East-Down convention, though is possibly a bit of a hack at the moment - don't trust it implicitly, but it works for visualisation.
+  Radius is in meters, with the sky centered at 0, so remember to add your point cloud's centerpoint to locate it correctly.
+
++---------------------------+
+  2. Filter on voxel weight
++---------------------------+
+  OPTIONAL: should only be necessary with particularly noisy LiDAR data.  Does not seem to improve Zeb1 data at all.
+  The filter-voxweight utility takes in a point cloud, filter size and weight threshold.
+  It voxelises by the filter size and removes all voxels composed of too few points.
+  It does not use "points-to-voxels" for this, as that wipes the existing fields.
+  Instead, you specify the fields it has and it does not change these, only filters.
+
+  $ filter-voxweight labelled.bin --binary=3d,ui --fields=x,y,z,trunk --voxel-size=0.05 --threshold=4 > $outDir/filtered.bin
+  $ cat labelled.bin | filter-voxweight - --binary=3d,ui --fields=x,y,z,trunk --voxel-size=0.05 --threshold=4 > $outDir/filtered.bin
+
++---------------------+
+  3. Thin point cloud
++---------------------+
+  Thinning the point cloud through voxelisation is used to normalise matter density
+  (else higher points in the cloud are less dense due to scattering) and also
+  to speed up raytracing by having fewer points around.
+
+  The thin-pointcloud utility subsamples a binary point cloud through voxelisation.
+  The point cloud is broken into individual voxels of a given size.
+  All points in a single voxel are replaced with a single point at their mean position.
+  This utility takes in a binary format and fields, and does not change these fields.
+
+  $ thin-pointcloud labelled.bin --binary=3d,ui --fields=x,y,z,trunk --voxel-size=0.1 |
+    view-points --binary=3d,ui --fields=x,y,z,id
+  $ cat labelled.bin | thin-pointcloud - --binary=3d,ui --fields=x,y,z,trunk --voxel-size=0.1 |
+    view-points --binary=3d,ui --fields=x,y,z,id
+
++-------------+
+  4. Raytrace
++-------------+
+  The raytrace-pc utility traces irradiances from a given sky through a given point cloud.
+  Raytracing is done using voxelisation, at a size given.  Larger voxel sizes (>0.1m) spread shadows larger, while
+    smaller voxel sizes (<0.04m) make shadows too spindly.  It's been determined qualitatively that 0.05-0.1m is a good range.
+  Beta controls the default transmission coefficient (though you can attach a "tc" field to specify per-point).
+
+  $ raytrace-pc labelled.bin --binary=3d,ui --fields=x,y,z,trunk --sky=sky.csv --raytrace-size=0.05 --beta=0.8 |
+    view-points --binary=3d,ui,2d --fields=x,y,z,id,energy,density
+
+    The output of the utility is the same format as the input, except with additional 2d:
+    -> energy: The energy (kJ) absorbed at each voxel for the given time period, distributed evenly to all points in the voxel
+    -> density: The PAR irradiance (W.mol/s/m^2) of that voxel; each point is a sample of the irradiance at that location.
+
+
++-------------------------+
+  Putting it all together
++-------------------------+
+  Using the above tools, it's simple to perform a raytrace.
+  If no trunk labelling is needed:
+  $ gen-sky --repeats=2 --time=1500 --sdate=20170905 --no-snap > sky.csv ; \
+  cat pointcloud.bin |
+    filter-voxweight - --binary=3d --fields=x,y,z --voxel-size=0.1 --threshold=1 |
+    thin-pointcloud - --binary=3d --fields=x,y,z --voxel-size=0.05 |
+   raytrace-pc - --binary=3d --fields=x,y,z --sky=sky.csv --raytrace-size=0.05 --beta=0.8 |
+   tee output.bin | view-points --binary=3d,2d --fields=x,y,z,,scalar --colour=0:100,hot
+
+
+================================================
+ To replicate results in 2018 COMPAG submission
+================================================
+First of all, you have to have your data organised in a certain way; the structure is at the end of this section.
+
++----------------+
+  raytrace-cepto
++----------------+
+This script does three main things:
+1. Align ceptometer stakes seen in point cloud (this process is manual and takes some time; only do if you have to)
+2. Raytraces the ceptometer-ed point cloud to take energy readings (Takes the most time out of any operation but requires no operator assistance)
+3. Analyses the output data of the trace
+
+Run the script from your data directory:
+$	~/src/tree-crops/light-interception/raytrace-cepto.sh georeferenced/r55-t15e-zeb-in-velo-frame.bin --repeats=15 --row=55 --tree=15 --from=e --cepto-file=cepto-data/processed/20160905/r55t15e-1400.csv --output-dir=outputs/20160905/r55t15e-1400 --openair-file=cepto-data/processed/open-20160905.csv
+The script will open a point cloud and request you select (by double-right-clicking) the four corner stakes of the ceptometer grid.
+Once the alignment is complete, it will show you the point cloud again so you can confirm whether the alignment succeeded before continuing.  The script will then perform the full raytrace-analyse process autonomously.
+Throughout the process, the script will save a number of intermediate and output files in the output directory.  These allow various results to be postprocessed independently, as well as allowing the use of the --no-align or --no-trace flags to skip the alignment or raytrace steps for future runs.
+
++----------------+
+  bulk-raytrace
++----------------+
+This script runs raytrace-cepto (minus the alignment stage) on all previously run output directories you give it.  So, if you wish to rerun the raytrace-analyse steps for all the trees, use this.
+Very simple to use if the data directory is set up appropriately:
+$	~/src/tree-crops/light-interception/bulk-raytrace.sh --output-dir=outputs/ --cepto-dir=cepto-data/processed/
+This will perform a basic run of raytracing on all valid output directories in --output-dir
+
++--------------------------+
+  Data directory structure
++--------------------------+
+Note: naming is important here; some of the scripts extract year/time/tree etc from the structure
+
+~/data
+├── labelled
+| 	├── 20160905
+|	  │   ├── r5-t23e-labelled.bin
+|	  │   └── ...
+|	  └── ...
+├── cepto-data/
+│   └── processed
+│   │   ├── 20160728
+│   │   │   ├── r45t24w-1000.csv
+│   │   │   ├── r55t15e-1400.csv
+│   │   │   ├── r8t12e-1100.csv
+│   │   │   ├── ...
+│   │   ├── ...
+│   │   ├── open-20160728.csv
+│   │   └── ...
+└── outputs
+	├── 20160905
+	│   ├── r45t24w-0900
+	│   ├── r55t15e-1400
+	│   ├── r8t12e-1100
+	│   └── ...
+	├── 20161215
+	│   ├── r45t24w-1000
+	│   ├── r55t15e-1200
+	│   ├── r8t12e-0900
+	│   ├── ...
+	└── ...

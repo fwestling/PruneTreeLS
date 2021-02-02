@@ -1,0 +1,138 @@
+#!/bin/bash
+
+## georeference
+## Given two point clouds, align them based on manual input.
+
+export readonly name=$( basename $0 )
+
+source $( type -p comma-application-util ) || (error "comma not installed")
+function errcho { (>&2 echo "$name: $1") }
+function error
+{
+    errcho "error: $1"
+    exit 1
+}
+
+function go () {
+	local ref=$1
+	local scan=$2
+	local binary=$3
+	local fields=$4
+  local transform=$5
+  local ef=$(echo $fields | csv-fields clear)
+  local cf=$(echo $fields | csv-fields clear --remove=x,y,z)
+
+  # TEMP=`mktemp -d`
+  TEMP="/home/fwes7558/tempdir"
+  mkdir $TEMP
+  GOHOME=$(pwd)
+
+  if [[ $align ]] 
+  then
+    rCenter=$(cat $ref | csv-shuffle --binary=$binary --fields=$fields -o=x,y,z |
+      csv-calc mean --binary=3d --fields=x,y,z | csv-from-bin 3d)
+    sCenter=$(cat $scan | csv-shuffle --binary=$binary --fields=$fields -o=x,y,z |
+      csv-calc mean --binary=3d --fields=x,y,z | csv-from-bin 3d)
+    alignment=$(echo "$rCenter,$sCenter" | points-align)
+    cat $ref | csv-shuffle --binary=$binary --fields=$fields -o=x,y,z | csv-from-bin 3d > $TEMP/ref.csv 
+    cat $scan | csv-paste "-;binary=$binary" "line-number" > $TEMP/id.bin
+    # cat $scan | csv-shuffle --binary=$binary --fields=$fields -o=x,y,z | csv-from-bin 3d > $TEMP/scanRaw.csv 
+    cat $scan | csv-shuffle --binary=$binary --fields=$fields -o=x,y,z | 
+      points-frame --binary=3d --fields=x,y,z --from=$(echo $alignment | cut -d, -f1-6) | csv-from-bin 3d > $TEMP/scan.csv 
+  else
+    cat $ref | csv-shuffle --binary=$binary --fields=$fields -o=x,y,z | csv-from-bin 3d > $TEMP/ref.csv 
+    cat $scan | csv-paste "-;binary=$binary" "line-number" > $TEMP/id.bin
+    cat $scan | csv-shuffle --binary=$binary --fields=$fields -o=x,y,z | csv-from-bin 3d > $TEMP/scan.csv 
+  fi
+
+  cd $TEMP
+
+  if [[ $verbose ]]
+  then 
+    cloudcompare.CloudCompare -SILENT -NO_TIMESTAMP -AUTO_SAVE OFF -C_EXPORT_FMT ASC -SEP COMMA \
+      -EXT csv -O -GLOBAL_SHIFT AUTO scan.csv -O -GLOBAL_SHIFT AUTO ref.csv -ICP -POP_CLOUDS -SAVE_CLOUDS FILE "output.csv"
+  else 
+    cloudcompare.CloudCompare -SILENT -NO_TIMESTAMP -AUTO_SAVE OFF -C_EXPORT_FMT ASC -SEP COMMA \
+      -EXT csv -O -GLOBAL_SHIFT AUTO scan.csv -O -GLOBAL_SHIFT AUTO ref.csv -ICP -POP_CLOUDS -SAVE_CLOUDS FILE "output.csv" >/dev/null 2>/dev/null
+  fi
+  echo "=====$TEMP=====" >&2
+  ls >&2
+  echo "===============" >&2
+
+  cd $GOHOME
+  echo "=====$TEMP=====" >&2
+  ls $TEMP >&2
+  echo "===============" >&2
+  tf=$(ls $TEMP | grep "REGISTRATION_MATRIX")
+
+  cat $TEMP/$tf > $transform
+
+  cat $TEMP/output.csv | csv-to-bin 3d | csv-paste "-;binary=3d" "line-number" | 
+   csv-join --fields=,,,id --binary=3d,ui "$TEMP/id.bin;binary=$binary,ui;fields=$ef,id" | 
+   csv-shuffle --binary=3d,ui,$binary,ui --fields=x,y,z,,$cf -o=$fields |
+   points-frame --binary=$binary --fields=$fields --from $transl |
+
+  if [[ $show ]] 
+  then
+    tee >(view-points --binary=$binary --fields=$fields --colour=blue "$ref;colour=red" --size=20000000) | cat
+  else 
+    cat
+  fi
+  # tee >(view-nice $ref $binary $fields) | cat
+
+  rm -rf $TEMP
+
+}
+
+
+function option-description
+{
+    cat <<eof
+--binary=[<binary>]; default=3d; Binary format of input files
+--fields=[<fields>]; default=x,y,z; Fields of input files. Must include x,y,z
+--transform=[<filename>]; default=/dev/null; Location to save transform file 
+--align, -a; Force a course alignment by matching centres
+--verbose, -v; Output progress to stderr
+--show, -s; Output progress to stderr
+eof
+}
+
+function usage
+{
+    cat <<eof
+
+$name Uses manual labelling to align two point clouds.  Once <scan> is aligned
+to <ref>, it is output to STDOUT.
+
+usage: $name <ref> <scan> [options]
+
+ref=[<pointcloud>]; Point cloud to align to
+scan=[<pointcloud>]; Point cloud to align
+
+options:
+$( option-description  | sed 's/^/    /g' )
+
+eof
+    exit 1
+}
+
+if (( $( comma_options_has --help $@ ) || $( comma_options_has -h $@ ) )) ; then usage ; fi
+options=$( option-description | comma-options-to-name-value "$@" ) || error "invalid command line options"
+comma_path_value_to_var --prefix="options" <<< "$options"
+eval "$( option-description | comma-options-to-name-value "$@" | comma_path_value_mangle )"
+
+(( $( comma_options_has --verbose "$@" ) )) && export readonly verbose=true
+(( $( comma_options_has --show "$@" ) )) && export readonly show=true
+(( $( comma_options_has --align "$@" ) )) && export readonly align=true
+
+# set -e # Kill if anything errors out; we don't want it to run everything on bad datasets
+
+echo $options_fields | csv-fields has --fields x,y,z || error "Missing fields x,y,z"
+
+function dw() {
+  echo "Don't worry about it!" >&2
+}
+
+# set -bm
+# trap dw ERR
+go $1 $2 $options_binary $options_fields $options_transform
